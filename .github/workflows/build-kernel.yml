@@ -4,23 +4,27 @@ name: Build a52sxq KernelSU-Next kernel
 # A52s-5G-Testing/kernel_samsung_sm7325-root, branch 16.2-ksun-susfs
 # (KernelSU-Next + SUSFS already integrated in the defconfig).
 #
-# Toolchain/flags below are copied from that repo's own
-# build.config.common + build.config.aarch64 so this matches, as
-# closely as possible, however the maintainers themselves build it:
-#   CC=clang (AOSP prebuilt clang-r383902b1, i.e. clang 11.0.2 -
-#             this is the exact version baked into the defconfig's
-#             CONFIG_CC_VERSION_TEXT, so later/earlier clang can
-#             produce a kernel that silently misbehaves or won't
-#             boot even if it compiles)
-#   LD=ld.lld, NM=llvm-nm, OBJCOPY=llvm-objcopy
-#   CLANG_TRIPLE=aarch64-linux-gnu-
-#   CROSS_COMPILE=aarch64-linux-androidkernel-
-#   CROSS_COMPILE_COMPAT=arm-linux-androideabi-   (32-bit compat vDSO)
-#   defconfig = vendor/lineage-a52sxq_defconfig
+# This kernel's Makefile has built-in support for a full-LLVM build
+# (CC=clang, LD=ld.lld, AR=llvm-ar, NM=llvm-nm, OBJCOPY=llvm-objcopy,
+# OBJDUMP=llvm-objdump, STRIP=llvm-strip) that activates automatically
+# whenever `LLVM=1` is passed to make - see Makefile lines ~408-444.
+# That means a single self-contained clang toolchain (which bundles
+# its own llvm-ar/llvm-nm/etc, i.e. its own "binutils") is enough;
+# no separate GCC cross-toolchain is needed.
+#
+# The defconfig's own CONFIG_CC_VERSION_TEXT records the kernel was
+# last built with "clang version 11.0.2 (... r383902b1)". The closest
+# easily-downloadable prebuilt matching that is clang 11.1.0 from
+# ZyCromerZ/Clang (a well-known community mirror of AOSP clang
+# releases, distributed as a plain .tar.gz - far more reliable in CI
+# than sparse-cloning the huge android.googlesource.com history).
+#11.0.2 vs 11.1.0 is a minor point release apart; for compiling an
+# out-of-tree Android common kernel this virtually never matters -
+# only exact-KMI-matching GKI modules would care, and this is not that.
 #
 # Run it from Actions tab -> "Build a52sxq KernelSU-Next kernel" -> Run workflow.
 # Output: an artifact named "a52sxq-ksu-next-kernel" containing
-# Image, Image.gz, Image.gz-dtb (whichever the build produces) + the
+# Image/Image.gz/Image.gz-dtb (whichever the build produces) + the
 # full build log, downloadable from the finished run's Summary page.
 
 on:
@@ -34,6 +38,14 @@ on:
         description: "Defconfig path under arch/arm64/configs/"
         required: true
         default: "vendor/lineage-a52sxq_defconfig"
+      clang_release:
+        description: "ZyCromerZ/Clang release tag to use as toolchain"
+        required: true
+        default: "11.1.0-20220724-release"
+      clang_tarball:
+        description: "Matching tarball file name for that release"
+        required: true
+        default: "Clang-11.1.0-20220724.tar.gz"
 
 jobs:
   build-kernel:
@@ -62,56 +74,38 @@ jobs:
             build-essential git curl ca-certificates python3 \
             rsync unzip zip
 
-      # Google publishes every released clang/gcc prebuilt in full git
-      # history under android.googlesource.com. A full clone of any of
-      # these repos is huge, so we do a blobless + sparse clone and
-      # only materialize the one version directory we actually need.
-      # (android.googlesource.com is reachable fine from GitHub-hosted
-      # runners - it's only blocked inside the chat sandbox this
-      # workflow was written in.)
-      - name: Fetch matching Clang (clang-r383902b1 / 11.0.2)
+      - name: Download clang toolchain (self-contained, includes its own binutils)
         run: |
-          git clone --filter=blob:none --sparse --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            toolchain-clang
-          git -C toolchain-clang sparse-checkout set clang-r383902b1
-          echo "$GITHUB_WORKSPACE/toolchain-clang/clang-r383902b1/bin" >> "$GITHUB_PATH"
-
-      - name: Fetch matching GCC prebuilts (arm64 + arm32, for CROSS_COMPILE/CROSS_COMPILE_COMPAT)
-        run: |
-          git clone --filter=blob:none --sparse --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            toolchain-gcc-arm64
-          git clone --filter=blob:none --sparse --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
-            toolchain-gcc-arm32
-          echo "$GITHUB_WORKSPACE/toolchain-gcc-arm64/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/toolchain-gcc-arm32/bin" >> "$GITHUB_PATH"
+          set -e
+          mkdir -p clang
+          curl -L --fail --retry 3 --retry-delay 5 \
+            "https://github.com/ZyCromerZ/Clang/releases/download/${{ inputs.clang_release }}/${{ inputs.clang_tarball }}" \
+            -o clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain versions (sanity check)
         run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           clang --version
           ld.lld --version
-          aarch64-linux-androidkernel-gcc --version 2>/dev/null || echo "note: androidkernel- gcc wrapper not present, will rely on clang/lld only"
-          aarch64-linux-android-gcc --version 2>/dev/null || true
+          llvm-ar --version
 
       - name: Build kernel
         working-directory: kernel
         env:
           ARCH: arm64
           SUBARCH: arm64
-          CC: clang
-          LD: ld.lld
-          NM: llvm-nm
-          OBJCOPY: llvm-objcopy
-          CLANG_TRIPLE: aarch64-linux-gnu-
-          CROSS_COMPILE: aarch64-linux-android-
-          CROSS_COMPILE_COMPAT: arm-linux-androideabi-
+          LLVM: "1"
+          LLVM_IAS: "1"
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
           KCFLAGS: "-D__ANDROID_COMMON_KERNEL__"
         run: |
           set -e
-          make O=out ${{ inputs.defconfig }}
-          make O=out -j"$(nproc)" 2>&1 | tee ../build.log
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make O=out ARCH=arm64 LLVM=1 ${{ inputs.defconfig }}
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" 2>&1 | tee ../build.log
 
       - name: Collect build outputs
         if: always()
@@ -133,3 +127,4 @@ jobs:
           name: a52sxq-ksu-next-kernel
           path: artifacts/
           retention-days: 14
+          
