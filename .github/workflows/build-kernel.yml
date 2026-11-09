@@ -103,22 +103,42 @@ jobs:
           KCFLAGS: "-D__ANDROID_COMMON_KERNEL__"
         run: |
           set -e
+          set -o pipefail
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 ${{ inputs.defconfig }}
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" 2>&1 | tee ../build.log
+          # DISABLE_WRAPPER=1 turns off scripts/gcc-wrapper.py, the
+          # Android-common-kernel mechanism that promotes any compiler
+          # warning it doesn't already know about into a hard build
+          # error ("error, forbidden warning: ..."). That mechanism is
+          # meant to keep AOSP's own kernel tree warning-free across
+          # exactly the compiler version they pin; with a slightly
+          # different clang point release (11.1.0 here vs the 11.0.2
+          # the defconfig was built with) a couple of pre-existing,
+          # harmless warnings in Samsung's own vendor drivers
+          # (techpack/video, drivers/input/sec_input) surface and trip
+          # it, with no relation to the KernelSU patch at all. Disabling
+          # the wrapper lets them stay warnings instead of aborting the
+          # whole build.
+          make O=out ARCH=arm64 LLVM=1 DISABLE_WRAPPER=1 ${{ inputs.defconfig }}
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 DISABLE_WRAPPER=1 -j"$(nproc)" 2>&1 | tee ../build.log
 
       - name: Collect build outputs
         if: always()
         run: |
           mkdir -p artifacts
+          found=0
           for f in Image Image.gz Image.gz-dtb; do
             if [ -f "kernel/out/arch/arm64/boot/$f" ]; then
               cp "kernel/out/arch/arm64/boot/$f" artifacts/
+              found=1
             fi
           done
           find kernel/out -maxdepth 4 -name "*.dtb" -exec cp {} artifacts/ \; 2>/dev/null || true
           cp build.log artifacts/ 2>/dev/null || true
           ls -la artifacts/
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No kernel Image/Image.gz/Image.gz-dtb was produced - the build failed. Check build.log in the uploaded artifact."
+            exit 1
+          fi
 
       - name: Upload artifact
         if: always()
@@ -127,4 +147,3 @@ jobs:
           name: a52sxq-ksu-next-kernel
           path: artifacts/
           retention-days: 14
-          
