@@ -130,10 +130,19 @@ jobs:
           KCFLAGS: "-D__ANDROID_COMMON_KERNEL__"
         run: |
           set -e
-          set -o pipefail
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           make O=out ARCH=arm64 LLVM=1 DISABLE_WRAPPER=1 ${{ inputs.defconfig }}
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 DISABLE_WRAPPER=1 -j"$(nproc)" 2>&1 | tee ../build.log
+          # Plain redirection, NOT `| tee`: a pipe's reader (tee) can
+          # close at any moment under heavy parallel (-jN) load, and
+          # this specific clang/llvm build (11.1.0) crashes outright
+          # ("LLVM ERROR: IO failure on output stream: Broken pipe",
+          # e.g. in llvm-nm) if it gets SIGPIPE while writing to a
+          # closed pipe. Writing straight to a file has no reader to
+          # close, so that whole crash class is structurally impossible
+          # here. (Trade-off: the Actions UI "live" log for this one
+          # step stays blank until it finishes - the full output is
+          # still in build.log, uploaded as an artifact either way.)
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 DISABLE_WRAPPER=1 -j"$(nproc)" > ../build.log 2>&1
 
       - name: Collect build outputs
         if: always()
