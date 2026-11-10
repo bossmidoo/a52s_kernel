@@ -1,0 +1,203 @@
+name: Build a52sxq KernelSU-Next kernel (5.4.302)
+
+# Builds the kernel for the device's CURRENT firmware (kernel 5.4.302,
+# clang 22.0.2), with KernelSU-Next + SUSFS merged in by hand, since no
+# public source tree with KernelSU already integrated against 302
+# exists yet.
+#
+# Base source: anhdat1024/android_kernel_samsung_sm7325, branch 17.0
+#   (SUBLEVEL=302, confirmed by commit hash match against the stock
+#   kernel's own version banner: "...g7a71935c393b..." = this branch's
+#   HEAD commit 7a71935c393b24dbe23b3caf7eb37cdf64aa820b)
+#
+# KernelSU-Next + SUSFS patch: ksu-302-merge.patch (next to this file).
+# How it was produced: A52s-5G-Testing/kernel_samsung_sm7325-root
+# (the only public KSU-integrated source for this device) is stuck on
+# the OLDER kernel_samsung_sm7325 base, SUBLEVEL=254. Its KernelSU
+# integration is commits aad7c518c..a70843aa5 (18 commits, purely
+# additive: 80 files changed, 12458 insertions, 0 deletions - no
+# existing kernel code was modified, only new drivers/kernelsu/* files
+# and small #ifdef-guarded hook additions). That full diff was
+# extracted and replayed against this 302 base:
+#   - 77 of 80 files applied with clean/fuzzy offsets, no changes needed.
+#   - include/linux/seccomp.h: dropped entirely - 302 already has the
+#     same atomic_t filter_count field upstream, natively.
+#   - arch/arm64/configs/vendor/lineage-a52sxq_defconfig: same 20 KSU
+#     Kconfig lines, just re-inserted above 302's (not 254's) header.
+#   - fs/proc/fd.c: same SUSFS mnt_id-spoofing hook, hand-adapted to
+#     302's newer seq_printf format (which added an "ino:" field
+#     upstream, unrelated to KernelSU, that the original 254-era patch
+#     didn't know about).
+# The resulting combined patch was verified to `git apply --check`
+# with exit code 0 against a completely fresh clone of 17.0.
+#
+# UPDATE 1: the patch disables Clang LTO (CONFIG_LTO_NONE=y, CFI_CLANG
+# dropped as a dependent) - a first attempt at fixing a build crash where
+# llvm-nm aborted with "LLVM ERROR: IO failure on output stream: Broken
+# pipe". This alone was NOT enough: with LTO off, the exact same class of
+# crash reappeared later in the build, this time from llvm-objdump instead.
+#
+# UPDATE 2 (the real fix): scripts/Makefile.build's cmd_modversions_c runs,
+# for every object file that exports symbols, a shell idiom like
+# `$(LLVM_NM) $@ | grep -q __ksymtab` (or the same with $(OBJDUMP) when LTO
+# is off). grep -q exits the instant it finds a match, closing its end of
+# the pipe while the LLVM tool may still be writing; this toolchain's
+# llvm-nm/llvm-objdump (11.1.0) abort hard on the resulting SIGPIPE instead
+# of exiting quietly like GNU nm/objdump would - so the crash could happen
+# in EITHER tool, regardless of the LTO setting. The patch rewrites all 3
+# occurrences of this idiom in scripts/Makefile.build to capture the tool's
+# full output via command substitution first (`printf '%s' "$$(TOOL ...)"
+# | grep -q ...`), so the tool always runs to completion and exits
+# normally before grep ever sees (or can prematurely close) the pipe. This
+# is the actual fix; LTO is kept off too as a harmless, already-verified
+# secondary change, not because it's load-bearing anymore. Verified
+# locally: rebuilt kernel/panic.o (which genuinely exports symbols, ie.
+# exercises the match branch) end-to-end with no errors.
+#
+# Run it from Actions tab -> "Build a52sxq KernelSU-Next kernel (5.4.302)" -> Run workflow.
+# Output: artifact "a52sxq-ksu-next-kernel-302" with Image + build.log.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "owner/repo of the 302 base kernel source"
+        required: true
+        default: "anhdat1024/android_kernel_samsung_sm7325"
+      kernel_ref:
+        description: "Branch/tag to build"
+        required: true
+        default: "17.0"
+      defconfig:
+        description: "Defconfig path under arch/arm64/configs/"
+        required: true
+        default: "vendor/lineage-a52sxq_defconfig"
+      clang_release:
+        description: "ZyCromerZ/Clang release tag to use as toolchain"
+        required: true
+        default: "11.1.0-20220724-release"
+      clang_tarball:
+        description: "Matching tarball file name for that release"
+        required: true
+        default: "Clang-11.1.0-20220724.tar.gz"
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Free up disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          df -h
+
+      # Checks out THIS repo (to get ksu-302-merge.patch) into the
+      # workspace root; the kernel source itself is checked out
+      # separately below, into ./kernel.
+      - name: Checkout this repo (for the merge patch)
+        uses: actions/checkout@v4
+
+      - name: Checkout 302 kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_ref }}
+          fetch-depth: 1
+          path: kernel
+
+      - name: Apply KernelSU-Next + SUSFS merge patch
+        working-directory: kernel
+        run: |
+          set -e
+          git apply --verbose ../ksu-302-merge.patch
+          echo "--- sanity check ---"
+          grep -m3 -E "^VERSION|^PATCHLEVEL|^SUBLEVEL" Makefile
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile
+          test -d drivers/kernelsu
+          # Fail fast (seconds, not an hour) if the llvm-nm/llvm-objdump
+          # SIGPIPE-abort fix didn't make it into the patch for some reason.
+          count="$(grep -c "printf '%s'" scripts/Makefile.build || true)"
+          if [ "$count" -lt 3 ]; then
+            echo "::error::scripts/Makefile.build is missing the SIGPIPE-safe printf fix (found $count/3 occurrences) - the build would crash again in llvm-nm/llvm-objdump. Check ksu-302-merge.patch."
+            exit 1
+          fi
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential git curl ca-certificates python3 \
+            rsync unzip zip
+
+      - name: Download clang toolchain (self-contained, includes its own binutils)
+        run: |
+          set -e
+          mkdir -p clang
+          curl -L --fail --retry 3 --retry-delay 5 \
+            "https://github.com/ZyCromerZ/Clang/releases/download/${{ inputs.clang_release }}/${{ inputs.clang_tarball }}" \
+            -o clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain versions (sanity check)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          clang --version
+          ld.lld --version
+          llvm-ar --version
+
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          LLVM: "1"
+          LLVM_IAS: "1"
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+          KCFLAGS: "-D__ANDROID_COMMON_KERNEL__"
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make O=out ARCH=arm64 LLVM=1 DISABLE_WRAPPER=1 ${{ inputs.defconfig }}
+          echo "--- sanity check: LTO should be OFF (secondary change, kept but not load-bearing anymore) ---"
+          grep -E "^CONFIG_LTO_CLANG=y|^CONFIG_LTO_NONE=y" out/.config || true
+          if grep -q "^CONFIG_LTO_CLANG=y" out/.config; then
+            echo "::error::CONFIG_LTO_CLANG is still enabled - the defconfig fix did not take effect."
+            exit 1
+          fi
+          # `| tee` for live Actions-UI output. The real SIGPIPE-abort fix
+          # now lives in scripts/Makefile.build itself (already verified
+          # present above), not in avoiding this pipe, so tee is safe here
+          # regardless of LTO state.
+          set -o pipefail
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 DISABLE_WRAPPER=1 -j"$(nproc)" 2>&1 | tee ../build.log
+
+      - name: Collect build outputs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          found=0
+          for f in Image Image.gz Image.gz-dtb; do
+            if [ -f "kernel/out/arch/arm64/boot/$f" ]; then
+              cp "kernel/out/arch/arm64/boot/$f" artifacts/
+              found=1
+            fi
+          done
+          find kernel/out -maxdepth 4 -name "*.dtb" -exec cp {} artifacts/ \; 2>/dev/null || true
+          cp build.log artifacts/ 2>/dev/null || true
+          ls -la artifacts/
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No kernel Image/Image.gz/Image.gz-dtb was produced - the build failed. Check build.log in the uploaded artifact."
+            exit 1
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a52sxq-ksu-next-kernel-302
+          path: artifacts/
+          retention-days: 14
