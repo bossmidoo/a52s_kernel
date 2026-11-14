@@ -1,4 +1,4 @@
-name: Build a52sxq KernelSU-Next kernel (5.4.302)
+name: Build a5
 
 # Builds the kernel for the device's CURRENT firmware (kernel 5.4.302,
 # clang 22.0.2), with KernelSU-Next + SUSFS merged in by hand, since no
